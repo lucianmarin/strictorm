@@ -1,0 +1,479 @@
+# StrictORM — Django-inspired ORM for Stricta with pluggable backends
+# Supports embedded StrictQL (strictql:///path), PostgreSQL & remote StrictQL (postgres://),
+# and SQLite (sqlite:// via backend_sqlite)
+from backends import base
+from backends import strictql
+from backends import postgres
+import json
+from backends.base import DbUrl, parse_db_url, QueryResult, Backend
+from json import DOM
+from typing import Callable
+
+def sql_quote(s: str) -> str:
+    return "'" + s.replace("'", "''") + "'"
+
+def sql_ident(name: str) -> str:
+    return '"' + name.replace('"', '""') + '"'
+
+class Field:
+    name: str
+    sql_type: str
+    primary_key: bool
+    unique: bool
+    nullable: bool
+    default_sql: str
+    fk_table: str
+
+    def __init__(self, name: str, sql_type: str, primary_key: bool = False, unique: bool = False, nullable: bool = False, default_sql: str = "", fk_table: str = "") -> None:
+        self.name = name
+        self.sql_type = sql_type
+        self.primary_key = primary_key
+        self.unique = unique
+        self.nullable = nullable
+        self.default_sql = default_sql
+        self.fk_table = fk_table
+
+    def to_ddl(self) -> str:
+        parts = sql_ident(self.name) + " " + self.sql_type
+        if self.primary_key:
+            parts += " PRIMARY KEY"
+        if self.unique and not self.primary_key:
+            parts += " UNIQUE"
+        if not self.nullable and not self.primary_key:
+            parts += " NOT NULL"
+        if len(self.default_sql) > 0:
+            parts += " DEFAULT " + self.default_sql
+        return parts
+
+def AutoField(name: str = "id") -> Field:
+    return Field(name, "SERIAL", True, True, False, "", "")
+
+def IntegerField(name: str, unique: bool = False, nullable: bool = False, default_sql: str = "") -> Field:
+    return Field(name, "BIGINT", False, unique, nullable, default_sql, "")
+
+def TextField(name: str, unique: bool = False, nullable: bool = False, default_sql: str = "") -> Field:
+    return Field(name, "TEXT", False, unique, nullable, default_sql, "")
+
+def BooleanField(name: str, nullable: bool = False, default_sql: str = "false") -> Field:
+    return Field(name, "BOOLEAN", False, False, nullable, default_sql, "")
+
+def FloatField(name: str, nullable: bool = False, default_sql: str = "") -> Field:
+    return Field(name, "DOUBLE PRECISION", False, False, nullable, default_sql, "")
+
+def DateTimeField(name: str, nullable: bool = False, default_sql: str = "") -> Field:
+    return Field(name, "TIMESTAMPTZ", False, False, nullable, default_sql, "")
+
+def ForeignKey(name: str, to_table: str, nullable: bool = False) -> Field:
+    return Field(name, "BIGINT", False, False, nullable, "", to_table)
+
+class Model:
+    table_name: str
+    fields: list[Field]
+    pk_name: str
+
+    def __init__(self, table_name: str, fields: list[Field]) -> None:
+        self.table_name = table_name
+        self.fields = fields
+        self.pk_name = "id"
+        for f in self.fields:
+            if f.primary_key:
+                self.pk_name = f.name.copy()
+                break
+
+    def create_table_sql(self) -> str:
+        col_ddls: list[str] = []
+        for f in self.fields:
+            col_ddls.append(f.to_ddl())
+        return f"CREATE TABLE IF NOT EXISTS {sql_ident(self.table_name)} (" + ", ".join(col_ddls) + ")"
+
+class Row:
+    table_name: str
+    columns: list[str]
+    data: dict[str, str]
+    nulls: dict[str, bool]
+
+    def __init__(self, table_name: str, columns: list[str], vals: list[str]) -> None:
+        self.table_name = table_name
+        self.columns = columns
+        self.data = {}
+        self.nulls = {}
+        i = 0
+        n = len(self.columns)
+        while i < n:
+            col = self.columns[i].copy()
+            v = vals[i].copy() if i < len(vals) else ""
+            if v == "NULL":
+                self.data[col.copy()] = ""
+                self.nulls[col] = True
+            else:
+                self.data[col.copy()] = v
+                self.nulls[col] = False
+            i += 1
+
+    def is_null(self, col: str) -> bool:
+        if col in self.nulls:
+            return self.nulls[col]
+        return True
+
+    def get_str(self, col: str, default: str = "") -> str:
+        if col in self.data and not self.is_null(col):
+            return self.data[col].copy()
+        return default.copy()
+
+    def get_int(self, col: str, default: int = 0) -> int:
+        if col in self.data and not self.is_null(col):
+            s = self.data[col]
+            if len(s) > 0:
+                return int(s)
+        return default
+
+    def get_bool(self, col: str, default: bool = False) -> bool:
+        if col in self.data and not self.is_null(col):
+            s = self.data[col].lower()
+            return s == "t" or s == "true" or s == "1"
+        return default
+
+    def to_json(self) -> DOM:
+        obj = json.json_object()
+        for col in self.columns:
+            if self.is_null(col):
+                obj.set(col.copy(), json.json_null())
+            else:
+                obj.set(col.copy(), json.json_str(self.data[col].copy()))
+        return obj
+
+def _build_lookup_sql(expr: str, val_sql: str, raw_val: str, is_str: bool) -> str:
+    sep = expr.find("__")
+    col = expr.copy()
+    op = "exact"
+    if sep > 0:
+        col = expr[0:sep]
+        op = expr[sep + 2:len(expr)]
+    qcol = sql_ident(col)
+    if op == "exact":
+        return f"{qcol} = {val_sql}"
+    if op == "ne":
+        return f"{qcol} != {val_sql}"
+    if op == "gt":
+        return f"{qcol} > {val_sql}"
+    if op == "gte":
+        return f"{qcol} >= {val_sql}"
+    if op == "lt":
+        return f"{qcol} < {val_sql}"
+    if op == "lte":
+        return f"{qcol} <= {val_sql}"
+    if op == "iexact":
+        return f"LOWER({qcol}) = LOWER({sql_quote(raw_val)})"
+    if op == "contains":
+        return f"{qcol} LIKE {sql_quote('%' + raw_val + '%')}"
+    if op == "icontains":
+        return f"{qcol} ILIKE {sql_quote('%' + raw_val + '%')}"
+    if op == "startswith":
+        return f"{qcol} LIKE {sql_quote(raw_val + '%')}"
+    if op == "endswith":
+        return f"{qcol} LIKE {sql_quote('%' + raw_val)}"
+    return f"{qcol} = {val_sql}"
+
+def q_eq(expr: str, val_s: str) -> str:
+    return _build_lookup_sql(expr, sql_quote(val_s), val_s, True)
+
+def q_int(expr: str, val_i: int) -> str:
+    s = str(val_i)
+    return _build_lookup_sql(expr, s, s, False)
+
+def q_and(a: str, b: str) -> str:
+    return f"({a} AND {b})"
+
+def q_or(a: str, b: str) -> str:
+    return f"({a} OR {b})"
+
+def q_not(a: str) -> str:
+    return f"(NOT ({a}))"
+
+_backends: list[Backend] = []
+
+def _exec_db(db_id: int, q: str) -> QueryResult:
+    b = _backends[db_id]
+    if b.kind == base.BACKEND_STRICTQL:
+        return strictql.exec_strictql(b.handle_id, q)
+    if b.kind == base.BACKEND_POSTGRES:
+        return postgres.exec_postgres(b.handle_id, q)
+    raise "ValueError: Unknown backend kind"
+
+def _close_db(db_id: int) -> None:
+    b = _backends[db_id]
+    if b.kind == base.BACKEND_STRICTQL:
+        strictql.close_strictql(b.handle_id)
+    elif b.kind == base.BACKEND_POSTGRES:
+        postgres.close_postgres(b.handle_id)
+
+class QuerySet:
+    db_id: int
+    table_name: str
+    joins: list[str]
+    wheres: list[str]
+    groups: list[str]
+    orders: list[str]
+    limit_n: int
+    offset_n: int
+    is_distinct: bool
+    select_cols: list[str]
+
+    def __init__(self, db_id: int, table_name: str) -> None:
+        self.db_id = db_id
+        self.table_name = table_name
+        self.joins = []
+        self.wheres = []
+        self.groups = []
+        self.orders = []
+        self.limit_n = -1
+        self.offset_n = -1
+        self.is_distinct = False
+        self.select_cols = []
+
+    def filter_raw(self, cond_sql: str) -> QuerySet:
+        self.wheres.append(cond_sql)
+        return self
+
+    def filter_or(self, conds: list[str]) -> QuerySet:
+        if len(conds) > 0:
+            self.wheres.append("(" + " OR ".join(conds) + ")")
+        return self
+
+    def join(self, table: str, on_clause: str, join_type: str = "INNER") -> QuerySet:
+        self.joins.append(f" {join_type} JOIN {sql_ident(table)} ON {on_clause}")
+        return self
+
+    def select(self, cols: list[str]) -> QuerySet:
+        self.select_cols = cols
+        return self
+
+    def group_by(self, col: str) -> QuerySet:
+        self.groups.append(col)
+        return self
+
+    def filter(self, expr: str, val_s: str) -> QuerySet:
+        self.wheres.append(_build_lookup_sql(expr, sql_quote(val_s), val_s, True))
+        return self
+
+    def filter_int(self, expr: str, val_i: int) -> QuerySet:
+        s = str(val_i)
+        self.wheres.append(_build_lookup_sql(expr, s, s, False))
+        return self
+
+    def filter_bool(self, col: str, val_b: bool) -> QuerySet:
+        bs = "true" if val_b else "false"
+        self.wheres.append(f"{sql_ident(col)} = {bs}")
+        return self
+
+    def filter_null(self, col: str, is_null: bool = True) -> QuerySet:
+        if is_null:
+            self.wheres.append(f"{sql_ident(col)} IS NULL")
+        else:
+            self.wheres.append(f"{sql_ident(col)} IS NOT NULL")
+        return self
+
+    def filter_in(self, col: str, vals: list[str]) -> QuerySet:
+        if len(vals) == 0:
+            self.wheres.append("1 = 0")
+            return self
+        quoted: list[str] = []
+        for v in vals:
+            quoted.append(sql_quote(v))
+        self.wheres.append(f"{sql_ident(col)} IN (" + ", ".join(quoted) + ")")
+        return self
+
+    def filter_in_ints(self, col: str, vals: list[int]) -> QuerySet:
+        if len(vals) == 0:
+            self.wheres.append("1 = 0")
+            return self
+        parts: list[str] = []
+        for v in vals:
+            parts.append(str(v))
+        self.wheres.append(f"{sql_ident(col)} IN (" + ", ".join(parts) + ")")
+        return self
+
+    def exclude(self, expr: str, val_s: str) -> QuerySet:
+        cond = _build_lookup_sql(expr, sql_quote(val_s), val_s, True)
+        self.wheres.append(f"NOT ({cond})")
+        return self
+
+    def exclude_int(self, expr: str, val_i: int) -> QuerySet:
+        s = str(val_i)
+        cond = _build_lookup_sql(expr, s, s, False)
+        self.wheres.append(f"NOT ({cond})")
+        return self
+
+    def order_by(self, field: str) -> QuerySet:
+        if field.startswith("-"):
+            col = field[1:len(field)]
+            self.orders.append(f"{sql_ident(col)} DESC")
+        else:
+            self.orders.append(f"{sql_ident(field)} ASC")
+        return self
+
+    def limit(self, n: int) -> QuerySet:
+        self.limit_n = n
+        return self
+
+    def offset(self, n: int) -> QuerySet:
+        self.offset_n = n
+        return self
+
+    def distinct(self) -> QuerySet:
+        self.is_distinct = True
+        return self
+
+    def _where_clause(self) -> str:
+        if len(self.wheres) == 0:
+            return ""
+        return " WHERE " + " AND ".join(self.wheres)
+
+    def _build_select_sql(self, override_cols: str = "") -> str:
+        dist = "DISTINCT " if self.is_distinct else ""
+        cols = override_cols.copy()
+        if len(cols) == 0:
+            if len(self.select_cols) > 0:
+                cols = ", ".join(self.select_cols)
+            else:
+                cols = "*"
+        join_sql = "".join(self.joins)
+        q = f"SELECT {dist}{cols} FROM {sql_ident(self.table_name)}{join_sql}{self._where_clause()}"
+        if len(self.groups) > 0 and len(override_cols) == 0:
+            q += " GROUP BY " + ", ".join(self.groups)
+        if len(self.orders) > 0 and len(override_cols) == 0:
+            q += " ORDER BY " + ", ".join(self.orders)
+        if self.limit_n >= 0 and len(override_cols) == 0:
+            q += f" LIMIT {self.limit_n}"
+        if self.offset_n >= 0 and len(override_cols) == 0:
+            q += f" OFFSET {self.offset_n}"
+        return q
+
+    def all(self) -> list[Row]:
+        q = self._build_select_sql()
+        res = _exec_db(self.db_id, q)
+        out: list[Row] = []
+        ri = 0
+        while ri < len(res.rows):
+            cols_copy: list[str] = []
+            for c in res.columns:
+                cols_copy.append(c.copy())
+            vals_copy: list[str] = []
+            for v in res.rows[ri]:
+                vals_copy.append(v.copy())
+            out.append(Row(self.table_name.copy(), cols_copy, vals_copy))
+            ri += 1
+        return out
+
+    def first(self) -> Row | None:
+        self.limit_n = 1
+        rows = self.all()
+        if len(rows) == 0:
+            return None
+        return rows.pop()
+
+    def count(self) -> int:
+        q = self._build_select_sql("COUNT(*)")
+        res = _exec_db(self.db_id, q)
+        if len(res.rows) > 0 and len(res.rows[0]) > 0:
+            return int(res.rows[0][0])
+        return 0
+
+    def exists(self) -> bool:
+        return self.count() > 0
+
+    def delete(self) -> int:
+        q = f"DELETE FROM {sql_ident(self.table_name)}{self._where_clause()}"
+        res = _exec_db(self.db_id, q)
+        return res.row_count
+
+    def update(self, values: dict[str, str]) -> int:
+        sets: list[str] = []
+        for k in values.keys():
+            sets.append(f"{sql_ident(k)} = {sql_quote(values[k])}")
+        q = f"UPDATE {sql_ident(self.table_name)} SET " + ", ".join(sets) + self._where_clause()
+        res = _exec_db(self.db_id, q)
+        return res.row_count
+
+    def create(self, values: dict[str, str]) -> Row:
+        cols: list[str] = []
+        vals: list[str] = []
+        for k in values.keys():
+            cols.append(sql_ident(k))
+            vals.append(sql_quote(values[k]))
+        q = f"INSERT INTO {sql_ident(self.table_name)} (" + ", ".join(cols) + ") VALUES (" + ", ".join(vals) + ") RETURNING *"
+        res = _exec_db(self.db_id, q)
+        cols_copy: list[str] = []
+        for c in res.columns:
+            cols_copy.append(c.copy())
+        vals_copy: list[str] = []
+        if len(res.rows) > 0:
+            for v in res.rows[0]:
+                vals_copy.append(v.copy())
+        return Row(self.table_name.copy(), cols_copy, vals_copy)
+
+class Database:
+    db_id: int
+    url: str
+    scheme: str
+
+    def __init__(self, url: str) -> None:
+        parsed = parse_db_url(url)
+        self.url = url.copy()
+        self.scheme = parsed.scheme.copy()
+        self.db_id = len(_backends)
+        if parsed.scheme == "strictql":
+            if len(parsed.host) > 0:
+                _backends.append(postgres.open_postgres(parsed))
+            else:
+                _backends.append(strictql.open_strictql(parsed))
+        elif parsed.scheme == "postgres" or parsed.scheme == "postgresql":
+            _backends.append(postgres.open_postgres(parsed))
+        else:
+            raise "ValueError: Unsupported database URL scheme: " + parsed.scheme
+
+    def create_table(self, model: Model) -> None:
+        ddl = model.create_table_sql()
+        pk_ty = _backends[self.db_id].auto_pk_type()
+        if pk_ty != "SERIAL":
+            ddl = ddl.replace(" SERIAL PRIMARY KEY", " " + pk_ty + " PRIMARY KEY")
+        _exec_db(self.db_id, ddl)
+
+    def objects(self, model: Model) -> QuerySet:
+        return QuerySet(self.db_id, model.table_name.copy())
+
+    def table(self, table_name: str) -> QuerySet:
+        return QuerySet(self.db_id, table_name)
+
+    def raw(self, sql_query: str) -> list[Row]:
+        res = _exec_db(self.db_id, sql_query)
+        out: list[Row] = []
+        ri = 0
+        while ri < len(res.rows):
+            cols_copy: list[str] = []
+            for c in res.columns:
+                cols_copy.append(c.copy())
+            vals_copy: list[str] = []
+            for v in res.rows[ri]:
+                vals_copy.append(v.copy())
+            out.append(Row("", cols_copy, vals_copy))
+            ri += 1
+        return out
+
+    def begin(self) -> None:
+        _exec_db(self.db_id, "BEGIN")
+
+    def commit(self) -> None:
+        _exec_db(self.db_id, "COMMIT")
+
+    def rollback(self) -> None:
+        _exec_db(self.db_id, "ROLLBACK")
+
+    def checkpoint(self) -> None:
+        _exec_db(self.db_id, "CHECKPOINT")
+
+    def close(self) -> None:
+        _close_db(self.db_id)
+
+def connect(url: str) -> Database:
+    return Database(url)

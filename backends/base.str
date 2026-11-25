@@ -1,0 +1,95 @@
+# StrictORM Backend interface, QueryResult, and DB URL parser
+
+class QueryResult:
+    columns: list[str]
+    rows: list[list[str]]
+    row_count: int
+
+    def __init__(self, columns: list[str], rows: list[list[str]], row_count: int = 0) -> None:
+        self.columns = columns
+        self.rows = rows
+        self.row_count = row_count
+
+class DbUrl:
+    scheme: str
+    user: str
+    password: str
+    host: str
+    port: int
+    database: str
+    path: str
+
+    def __init__(self, scheme: str, user: str, password: str, host: str, port: int, database: str, path: str) -> None:
+        self.scheme = scheme
+        self.user = user
+        self.password = password
+        self.host = host
+        self.port = port
+        self.database = database
+        self.path = path
+
+def parse_db_url(url: str) -> DbUrl:
+    sep = url.find("://")
+    if sep < 0:
+        return DbUrl("strictql", "", "", "", 0, "", url.copy())
+    scheme = url[0:sep].lower()
+    rest = url[sep + 3:len(url)]
+    if scheme == "sqlite":
+        return DbUrl(scheme, "", "", "", 0, "", rest)
+    if scheme == "strictql":
+        # strictql:///abs/path or strictql://:memory: -> embedded file
+        # strictql://host:port/db -> remote PG wire server
+        if rest.startswith("/") or rest == ":memory:" or (rest.find(":") < 0 and rest.find("@") < 0):
+            return DbUrl(scheme, "", "", "", 0, "", rest)
+    user = ""
+    password = ""
+    host = ""
+    port = 0
+    slash = rest.find("/")
+    authority = rest[0:slash] if slash >= 0 else rest.copy()
+    path = rest[slash + 1:len(rest)] if slash >= 0 else ""
+    database = path.copy()
+    at = authority.find("@")
+    hostport = authority.copy()
+    if at >= 0:
+        userinfo = authority[0:at]
+        hostport = authority[at + 1:len(authority)]
+        colon = userinfo.find(":")
+        if colon >= 0:
+            user = userinfo[0:colon]
+            password = userinfo[colon + 1:len(userinfo)]
+        else:
+            user = userinfo
+    hcolon = hostport.find(":")
+    if hcolon >= 0:
+        host = hostport[0:hcolon]
+        pstr = hostport[hcolon + 1:len(hostport)]
+        if len(pstr) > 0:
+            port = int(pstr)
+    else:
+        host = hostport
+    return DbUrl(scheme, user, password, host, port, database, path)
+
+BACKEND_STRICTQL: int = 0
+BACKEND_POSTGRES: int = 1
+BACKEND_SQLITE: int = 2
+
+class Backend:
+    scheme: str
+    kind: int
+    handle_id: int
+    pk_type: str
+    ilike: str
+
+    def __init__(self, scheme: str, kind: int, handle_id: int, pk_type: str = "SERIAL", ilike: str = "ILIKE") -> None:
+        self.scheme = scheme
+        self.kind = kind
+        self.handle_id = handle_id
+        self.pk_type = pk_type
+        self.ilike = ilike
+
+    def auto_pk_type(self) -> str:
+        return self.pk_type.copy()
+
+    def ilike_op(self) -> str:
+        return self.ilike.copy()

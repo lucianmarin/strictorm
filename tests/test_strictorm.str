@@ -1,0 +1,83 @@
+import strictorm
+import os
+
+def main() -> None:
+    db_path = "/tmp/test_strictorm_unit.strictql"
+    if os.exists(db_path):
+        os.remove(db_path)
+    if os.exists(db_path + ".wal"):
+        os.remove(db_path + ".wal")
+
+    # 0. DB URL parsing
+    pg = strictorm.parse_db_url("postgres://alice:secret@localhost:5432/subreply")
+    assert pg.scheme == "postgres"
+    assert pg.user == "alice"
+    assert pg.password == "secret"
+    assert pg.host == "localhost"
+    assert pg.port == 5432
+    assert pg.database == "subreply"
+
+    db = strictorm.connect("strictql://" + db_path)
+
+    user_fields: list[strictorm.Field] = [
+        strictorm.AutoField("id"),
+        strictorm.TextField("username", True, False),
+        strictorm.TextField("bio", False, True),
+    ]
+    User = strictorm.Model("app_user", user_fields)
+    db.create_table(User)
+
+    # 1. Create rows
+    u1 = db.objects(User).create({"username": "lucian", "bio": "Building Stricta"})
+    u2 = db.objects(User).create({"username": "alice", "bio": "Rust and SQL"})
+    u3 = db.objects(User).create({"username": "bob", "bio": "StrictQL fan"})
+    assert u1.get_int("id") == 1
+    assert u1.get_str("username") == "lucian"
+    assert u2.get_int("id") == 2
+
+    # 2. Count & exists
+    assert db.objects(User).count() == 3
+    assert db.objects(User).filter("username", "lucian").exists()
+    assert not db.objects(User).filter("username", "nobody").exists()
+
+    # 3. Lookups: icontains, exclude, order_by, limit
+    strict_users = db.objects(User).filter("bio__icontains", "strict").order_by("-id").all()
+    assert len(strict_users) == 2
+    assert strict_users[0].get_str("username") == "bob"
+    assert strict_users[1].get_str("username") == "lucian"
+
+    # 4. filter_in & first
+    picked = db.objects(User).filter_in("username", ["alice", "bob"]).order_by("username").first()
+    assert picked is not None
+    assert picked.get_str("username") == "alice"
+
+    # 5. Update
+    updated = db.objects(User).filter("username", "bob").update({"bio": "Updated bio"})
+    assert updated == 1
+    bob = db.objects(User).filter("username", "bob").first()
+    assert bob is not None and bob.get_str("bio") == "Updated bio"
+
+    # 6. Delete
+    deleted = db.objects(User).filter("username", "alice").delete()
+    assert deleted == 1
+    assert db.objects(User).count() == 2
+
+    # 7. Q / filter_or + raw()
+    or_rows = db.objects(User).filter_or([
+        strictorm.q_eq("username", "lucian"),
+        strictorm.q_eq("username", "bob"),
+    ]).order_by("id").all()
+    assert len(or_rows) == 2
+
+    raw_rows = db.raw('SELECT COUNT(*) FROM "app_user"')
+    assert len(raw_rows) == 1 and raw_rows[0].get_int(raw_rows[0].columns[0].copy()) == 2
+
+    db.checkpoint()
+    db.close()
+    os.remove(db_path)
+    if os.exists(db_path + ".wal"):
+        os.remove(db_path + ".wal")
+
+    print("test_strictorm: PASS")
+
+main()

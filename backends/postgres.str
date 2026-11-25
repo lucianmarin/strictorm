@@ -1,0 +1,301 @@
+# PostgreSQL v3 Wire Protocol Client Backend for StrictORM
+# Works with both PostgreSQL and remote StrictQL servers (pgwire.str)
+import base
+import sys
+from base import Backend, QueryResult, DbUrl
+
+@extern("socket")
+def _pgc_socket(domain: i32, stype: i32, proto: i32) -> i32:
+    pass
+
+@extern("connect")
+def _pgc_connect(fd: i32, addr_ptr: addr[u8], addrlen: i32) -> i32:
+    pass
+
+@extern("read")
+def _pgc_read(fd: i32, buf: addr[u8], n: int) -> int:
+    pass
+
+@extern("write")
+def _pgc_write(fd: i32, buf: addr[u8], n: int) -> int:
+    pass
+
+@extern("close")
+def _pgc_close(fd: i32) -> i32:
+    pass
+
+@extern("inet_pton")
+def _pgc_inet_pton(af: i32, src: addr[u8], dst: addr[u8]) -> i32:
+    pass
+
+@extern("malloc")
+def _pgc_malloc(n: int) -> addr[u8]:
+    pass
+
+@extern("free")
+def _pgc_free(p: addr[u8]) -> None:
+    pass
+
+@extern("memset")
+def _pgc_memset(p: addr[u8], c: i32, n: int) -> addr[u8]:
+    pass
+
+@extern("memcpy")
+def _pgc_memcpy(dst: addr[u8], src: addr[u8], n: int) -> addr[u8]:
+    pass
+
+def _put_be32(buf: addr[u8], off: int, v: int) -> None:
+    buf[off] = u8((v >> 24) & 255)
+    buf[off + 1] = u8((v >> 16) & 255)
+    buf[off + 2] = u8((v >> 8) & 255)
+    buf[off + 3] = u8(v & 255)
+
+def _get_be32(buf: addr[u8], off: int) -> int:
+    b0 = int(buf[off])
+    b1 = int(buf[off + 1])
+    b2 = int(buf[off + 2])
+    b3 = int(buf[off + 3])
+    v = (b0 << 24) | (b1 << 16) | (b2 << 8) | b3
+    if v >= 2147483648:
+        v = v - 4294967296
+    return v
+
+def _get_be16(buf: addr[u8], off: int) -> int:
+    return (int(buf[off]) << 8) | int(buf[off + 1])
+
+def _send_all(fd: i32, buf: addr[u8], n: int) -> bool:
+    sent = 0
+    while sent < n:
+        r = _pgc_write(fd, buf + sent, n - sent)
+        if r <= 0:
+            return False
+        sent += r
+    return True
+
+def _recv_exact(fd: i32, buf: addr[u8], n: int) -> bool:
+    got = 0
+    while got < n:
+        r = _pgc_read(fd, buf + got, n - got)
+        if r <= 0:
+            return False
+        got += r
+    return True
+
+def _tcp_connect(host: str, port: int) -> i32:
+    ip = "127.0.0.1" if (len(host) == 0 or host == "localhost") else host
+    fd = _pgc_socket(i32(2), i32(1), i32(0))
+    if int(fd) < 0:
+        raise "RuntimeError: socket() failed"
+    sa = _pgc_malloc(16)
+    _pgc_memset(sa, i32(0), 16)
+    if sys.platform == "darwin":
+        sa[0] = u8(16)
+        sa[1] = u8(2)
+    else:
+        sa[0] = u8(2)
+        sa[1] = u8(0)
+    sa[2] = u8((port >> 8) & 255)
+    sa[3] = u8(port & 255)
+    rc = _pgc_inet_pton(i32(2), ip.bin, sa + 4)
+    if int(rc) != 1:
+        _pgc_free(sa)
+        _pgc_close(fd)
+        raise "RuntimeError: invalid IPv4 host: " + ip
+    cr = _pgc_connect(fd, sa, i32(16))
+    _pgc_free(sa)
+    if int(cr) < 0:
+        _pgc_close(fd)
+        raise "RuntimeError: connect() failed to " + ip + ":" + str(port)
+    return fd
+
+def _cstr_from(buf: addr[u8], off: int, n: int) -> str:
+    tmp = _pgc_malloc(n + 1)
+    if n > 0:
+        _pgc_memcpy(tmp, buf + off, n)
+    tmp[n] = u8(0)
+    s = unbin(tmp)
+    _pgc_free(tmp)
+    return s
+
+class PostgresBackend:
+    fd: i32
+
+    def __init__(self, u: DbUrl) -> None:
+        port = u.port if u.port > 0 else 5432
+        user = u.user.copy() if len(u.user) > 0 else "postgres"
+        db = u.database.copy() if len(u.database) > 0 else "postgres"
+        self.fd = _tcp_connect(u.host.copy(), port)
+        self._startup(user, u.password.copy(), db)
+
+    def _startup(self, user: str, password: str, db: str) -> None:
+        # Build StartupMessage: len(4) + proto(4) + "user\0" + user + "\0database\0" + db + "\0\0"
+        body_len = 8 + 5 + len(user) + 1 + 9 + len(db) + 2
+        buf = _pgc_malloc(body_len)
+        _put_be32(buf, 0, body_len)
+        _put_be32(buf, 4, 196608)
+        off = 8
+        k1 = "user"
+        _pgc_memcpy(buf + off, k1.bin, 4)
+        off += 4
+        buf[off] = u8(0)
+        off += 1
+        if len(user) > 0:
+            _pgc_memcpy(buf + off, user.bin, len(user))
+            off += len(user)
+        buf[off] = u8(0)
+        off += 1
+        k2 = "database"
+        _pgc_memcpy(buf + off, k2.bin, 8)
+        off += 8
+        buf[off] = u8(0)
+        off += 1
+        if len(db) > 0:
+            _pgc_memcpy(buf + off, db.bin, len(db))
+            off += len(db)
+        buf[off] = u8(0)
+        off += 1
+        buf[off] = u8(0)
+        ok = _send_all(self.fd, buf, body_len)
+        _pgc_free(buf)
+        if not ok:
+            raise "RuntimeError: failed to send PG startup message"
+
+        hdr = _pgc_malloc(5)
+        while True:
+            if not _recv_exact(self.fd, hdr, 5):
+                _pgc_free(hdr)
+                raise "RuntimeError: unexpected EOF during PG startup"
+            mtype = int(hdr[0])
+            mlen = _get_be32(hdr, 1) - 4
+            payload = _pgc_malloc(mlen + 1) if mlen > 0 else _pgc_malloc(1)
+            if mlen > 0:
+                if not _recv_exact(self.fd, payload, mlen):
+                    _pgc_free(payload)
+                    _pgc_free(hdr)
+                    raise "RuntimeError: unexpected EOF reading PG startup payload"
+            if mtype == 82: # 'R' Authentication
+                auth_code = _get_be32(payload, 0)
+                if auth_code == 3: # CleartextPassword
+                    plen = 4 + len(password) + 1
+                    pbuf = _pgc_malloc(1 + plen)
+                    pbuf[0] = u8(112) # 'p'
+                    _put_be32(pbuf, 1, plen)
+                    if len(password) > 0:
+                        _pgc_memcpy(pbuf + 5, password.bin, len(password))
+                    pbuf[5 + len(password)] = u8(0)
+                    _send_all(self.fd, pbuf, 1 + plen)
+                    _pgc_free(pbuf)
+            elif mtype == 69: # 'E' ErrorResponse
+                msg = _cstr_from(payload, 0, mlen)
+                _pgc_free(payload)
+                _pgc_free(hdr)
+                raise "RuntimeError: PG startup error: " + msg
+            elif mtype == 90: # 'Z' ReadyForQuery
+                _pgc_free(payload)
+                break
+            _pgc_free(payload)
+        _pgc_free(hdr)
+
+    def execute(self, sql_query: str) -> QueryResult:
+        qlen = len(sql_query)
+        mlen = 4 + qlen + 1
+        qbuf = _pgc_malloc(1 + mlen)
+        qbuf[0] = u8(81) # 'Q'
+        _put_be32(qbuf, 1, mlen)
+        if qlen > 0:
+            _pgc_memcpy(qbuf + 5, sql_query.bin, qlen)
+        qbuf[5 + qlen] = u8(0)
+        ok = _send_all(self.fd, qbuf, 1 + mlen)
+        _pgc_free(qbuf)
+        if not ok:
+            raise "RuntimeError: PG write failed"
+
+        cols: list[str] = []
+        rows: list[list[str]] = []
+        affected = 0
+        err_msg = ""
+
+        hdr = _pgc_malloc(5)
+        while True:
+            if not _recv_exact(self.fd, hdr, 5):
+                _pgc_free(hdr)
+                raise "RuntimeError: PG connection closed"
+            mtype = int(hdr[0])
+            plen = _get_be32(hdr, 1) - 4
+            payload = _pgc_malloc(plen + 1) if plen > 0 else _pgc_malloc(1)
+            if plen > 0:
+                if not _recv_exact(self.fd, payload, plen):
+                    _pgc_free(payload)
+                    _pgc_free(hdr)
+                    raise "RuntimeError: PG truncated message"
+            if mtype == 84: # 'T' RowDescription
+                ncols = _get_be16(payload, 0)
+                off = 2
+                ci = 0
+                while ci < ncols and off < plen:
+                    start = off
+                    while off < plen and int(payload[off]) != 0:
+                        off += 1
+                    cols.append(_cstr_from(payload, start, off - start))
+                    off += 1 + 18 # NUL + 18 bytes of field metadata
+                    ci += 1
+            elif mtype == 68: # 'D' DataRow
+                ncols = _get_be16(payload, 0)
+                off = 2
+                row: list[str] = []
+                ci = 0
+                while ci < ncols and off + 4 <= plen:
+                    flen = _get_be32(payload, off)
+                    off += 4
+                    if flen < 0:
+                        row.append("")
+                    else:
+                        row.append(_cstr_from(payload, off, flen))
+                        off += flen
+                    ci += 1
+                rows.append(row)
+            elif mtype == 69: # 'E' ErrorResponse
+                # Extract 'M' field
+                off = 0
+                while off < plen and int(payload[off]) != 0:
+                    ftype = int(payload[off])
+                    off += 1
+                    start = off
+                    while off < plen and int(payload[off]) != 0:
+                        off += 1
+                    if ftype == 77: # 'M'
+                        err_msg = _cstr_from(payload, start, off - start)
+                    off += 1
+            elif mtype == 90: # 'Z' ReadyForQuery
+                _pgc_free(payload)
+                break
+            _pgc_free(payload)
+        _pgc_free(hdr)
+
+        if len(err_msg) > 0:
+            raise "DatabaseError: " + err_msg
+        return QueryResult(cols, rows, affected)
+
+    def close(self) -> None:
+        if int(self.fd) >= 0:
+            tbuf = _pgc_malloc(5)
+            tbuf[0] = u8(88) # 'X'
+            _put_be32(tbuf, 1, 4)
+            _send_all(self.fd, tbuf, 5)
+            _pgc_free(tbuf)
+            _pgc_close(self.fd)
+            self.fd = i32(-1)
+
+_pg_conns: list[PostgresBackend] = []
+
+def exec_postgres(idx: int, sql_query: str) -> QueryResult:
+    return _pg_conns[idx].execute(sql_query)
+
+def close_postgres(idx: int) -> None:
+    _pg_conns[idx].close()
+
+def open_postgres(u: DbUrl) -> Backend:
+    idx = len(_pg_conns)
+    scheme = u.scheme.copy()
+    _pg_conns.append(PostgresBackend(u))
+    return Backend(scheme, base.BACKEND_POSTGRES, idx, "SERIAL", "ILIKE")

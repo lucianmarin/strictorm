@@ -1,0 +1,6 @@
+name: "strictorm"
+version: "0.1.0"
+entry: "strictorm.str"
+deps:
+    strlib: "lucianmarin/strlib"
+    strictql: "lucianmarin/strictql"

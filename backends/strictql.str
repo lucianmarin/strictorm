@@ -1,0 +1,29 @@
+# Embedded StrictQL backend for StrictORM
+import base
+import engine
+from base import Backend, QueryResult, DbUrl
+
+_strictql_dbs: list[engine.Database] = []
+
+def exec_strictql(idx: int, sql_query: str) -> QueryResult:
+    res = _strictql_dbs[idx].execute(sql_query)
+    cols: list[str] = []
+    for c in res.columns:
+        cols.append(c.copy())
+    rows: list[list[str]] = []
+    ri = 0
+    while ri < len(res.rows):
+        r: list[str] = []
+        for v in res.rows[ri]:
+            r.append(v.copy())
+        rows.append(r)
+        ri += 1
+    return QueryResult(cols, rows, res.row_count)
+
+def close_strictql(idx: int) -> None:
+    _strictql_dbs[idx].close()
+
+def open_strictql(u: DbUrl) -> Backend:
+    idx = len(_strictql_dbs)
+    _strictql_dbs.append(engine.open_db(u.path.copy()))
+    return Backend("strictql", base.BACKEND_STRICTQL, idx, "SERIAL", "ILIKE")

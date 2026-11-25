@@ -1,0 +1,114 @@
+# SQLite3 Backend for StrictORM (via libsqlite3 C FFI; link with -lsqlite3)
+import base
+from base import Backend, QueryResult, DbUrl
+
+@extern("sqlite3_open")
+def _sqlite3_open(filename: addr[u8], ppDb: addr[addr[u8]]) -> i32:
+    pass
+
+@extern("sqlite3_close")
+def _sqlite3_close(db: addr[u8]) -> i32:
+    pass
+
+@extern("sqlite3_prepare_v2")
+def _sqlite3_prepare_v2(db: addr[u8], zSql: addr[u8], nByte: i32, ppStmt: addr[addr[u8]], pzTail: addr[u8] | None) -> i32:
+    pass
+
+@extern("sqlite3_step")
+def _sqlite3_step(stmt: addr[u8]) -> i32:
+    pass
+
+@extern("sqlite3_column_count")
+def _sqlite3_column_count(stmt: addr[u8]) -> i32:
+    pass
+
+@extern("sqlite3_column_name")
+def _sqlite3_column_name(stmt: addr[u8], iCol: i32) -> addr[u8] | None:
+    pass
+
+@extern("sqlite3_column_text")
+def _sqlite3_column_text(stmt: addr[u8], iCol: i32) -> addr[u8] | None:
+    pass
+
+@extern("sqlite3_finalize")
+def _sqlite3_finalize(stmt: addr[u8]) -> i32:
+    pass
+
+@extern("sqlite3_changes")
+def _sqlite3_changes(db: addr[u8]) -> i32:
+    pass
+
+@extern("sqlite3_errmsg")
+def _sqlite3_errmsg(db: addr[u8]) -> addr[u8] | None:
+    pass
+
+class SqliteBackend:
+    handle: addr[u8]
+
+    def __init__(self, path: str) -> None:
+        db_ptr: addr[u8] = addr[u8](0)
+        rc = _sqlite3_open(path.bin, db_ptr.addr)
+        if int(rc) != 0:
+            raise "DatabaseError: sqlite3_open failed for " + path
+        self.handle = db_ptr
+
+    def execute(self, sql_query: str) -> QueryResult:
+        stmt_ptr: addr[u8] = addr[u8](0)
+        rc = _sqlite3_prepare_v2(self.handle, sql_query.bin, i32(-1), stmt_ptr.addr, None)
+        if int(rc) != 0:
+            ep = _sqlite3_errmsg(self.handle)
+            emsg = unbin(ep) if ep is not None else "prepare failed"
+            raise "DatabaseError: " + emsg
+
+        ncols = int(_sqlite3_column_count(stmt_ptr))
+        cols: list[str] = []
+        ci = 0
+        while ci < ncols:
+            np = _sqlite3_column_name(stmt_ptr, i32(ci))
+            cols.append(unbin(np) if np is not None else "")
+            ci += 1
+
+        rows: list[list[str]] = []
+        while True:
+            sr = int(_sqlite3_step(stmt_ptr))
+            if sr == 100: # SQLITE_ROW
+                row: list[str] = []
+                ci = 0
+                while ci < ncols:
+                    vp = _sqlite3_column_text(stmt_ptr, i32(ci))
+                    row.append(unbin(vp) if vp is not None else "")
+                    ci += 1
+                rows.append(row)
+            elif sr == 101: # SQLITE_DONE
+                break
+            else:
+                _sqlite3_finalize(stmt_ptr)
+                ep = _sqlite3_errmsg(self.handle)
+                emsg = unbin(ep) if ep is not None else "step failed"
+                raise "DatabaseError: " + emsg
+
+        _sqlite3_finalize(stmt_ptr)
+        affected = int(_sqlite3_changes(self.handle))
+        return QueryResult(cols, rows, affected)
+
+    def close(self) -> None:
+        _sqlite3_close(self.handle)
+
+    def auto_pk_type(self) -> str:
+        return "INTEGER"
+
+    def ilike_op(self) -> str:
+        return "LIKE"
+
+_sqlite_conns: list[SqliteBackend] = []
+
+def exec_sqlite(idx: int, sql_query: str) -> QueryResult:
+    return _sqlite_conns[idx].execute(sql_query)
+
+def close_sqlite(idx: int) -> None:
+    _sqlite_conns[idx].close()
+
+def open_sqlite(u: DbUrl) -> Backend:
+    idx = len(_sqlite_conns)
+    _sqlite_conns.append(SqliteBackend(u.path.copy()))
+    return Backend("sqlite", base.BACKEND_SQLITE, idx, "INTEGER", "LIKE")
