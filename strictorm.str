@@ -7,7 +7,6 @@ from backends import postgres
 import json
 from backends.base import DbUrl, parse_db_url, QueryResult, Backend
 from json import DOM
-from typing import Callable
 
 def sql_quote(s: str) -> str:
     return "'" + s.replace("'", "''") + "'"
